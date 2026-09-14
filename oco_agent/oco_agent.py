@@ -286,6 +286,58 @@ def fileWriteFlags():
 	else:
 		return os.O_WRONLY | os.O_CREAT | os.O_SYNC
 
+def pendingPasswordsPath():
+	global DEFAULT_TSTAMP_PATH
+	return os.path.join(os.path.dirname(DEFAULT_TSTAMP_PATH), 'oco-agent.pending-passwords.json')
+
+def writePendingPasswords(entries):
+	path = pendingPasswordsPath()
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	with os.fdopen(os.open(path, fileWriteFlags(), 0o600), 'w') as fileHandle:
+		fileHandle.write(json.dumps(entries))
+	try:
+		os.chmod(path, 0o600) # enforce permissions regardless of umask
+	except Exception:
+		pass
+
+def readPendingPasswords():
+	path = pendingPasswordsPath()
+	if not os.path.isfile(path):
+		return []
+	try:
+		with open(path, 'r') as fileHandle:
+			return json.loads(fileHandle.read() or '[]')
+	except Exception as e:
+		logger('Unable to read pending password report file, ignoring it:', e)
+		return []
+
+def clearPendingPasswords():
+	path = pendingPasswordsPath()
+	if os.path.isfile(path):
+		os.remove(path)
+
+def flushPendingPasswords():
+	# retry reporting any password that was successfully changed locally in a
+	# previous run but never got confirmed to the server (e.g. agent crashed
+	# or lost network connectivity right after the local change)
+	pending = readPendingPasswords()
+	if not pending:
+		return
+	remaining = []
+	for entry in pending:
+		try:
+			jsonRequest('oco.agent.passwords', {'passwords': [
+				{'username': entry['username'], 'password': encrypt(entry['password'], config['agent-key'])}
+			]})
+			logger('Reported previously pending password for "'+str(entry.get('username'))+'" to server')
+		except Exception as e:
+			logger('Unable to report pending password for "'+str(entry.get('username'))+'", will retry later:', e)
+			remaining.append(entry)
+	if remaining:
+		writePendingPasswords(remaining)
+	else:
+		clearPendingPasswords()
+
 def writeTimestamp(tstamp):
 	global DEFAULT_TSTAMP_PATH
 	os.makedirs(os.path.dirname(DEFAULT_TSTAMP_PATH), exist_ok=True)
@@ -600,42 +652,53 @@ def mainloop(args):
 			if(len(events) > 0):
 				jsonRequest('oco.agent.events', {'events':events}, False)
 
+		# make sure no previously confirmed-but-unreported password is stuck locally
+		# (e.g. agent crashed or lost network connectivity right after a successful
+		# local change, before the server could confirm receipt) - retry it first,
+		# before attempting any new rotation this cycle
+		flushPendingPasswords()
+
 		# update admin password if requested
 		if('update-passwords' in responseJson['result']['params']):
 			pwr = password_rotation.PasswordRotation()
-			newPasswords = []
-			newPasswordsRequest = []
-			try:
-				for item in responseJson['result']['params']['update-passwords']:
+			for item in responseJson['result']['params']['update-passwords']:
+				username = item.get('username')
+				try:
 					newPassword = pwr.generatePassword(item['alphabet'], item['length'])
-					newPasswords.append({
-						'username': item['username'],
-						'password': newPassword,
-						'old_password': item['old_password'] if 'old_password' in item else ''
-					})
-					newPasswordsRequest.append({
-						'username': item['username'],
-						'password': encrypt(newPassword, config['agent-key'])
-					})
-				# store the new passwords on the server
-				jsonRequest('oco.agent.passwords', {'passwords':newPasswordsRequest})
-				# change them locally - only if jsonRequest succeeded to be sure that new passwords do not get lost
-				for item in newPasswords:
-					try:
-						pwr.updatePassword(item['username'], item['password'], item['old_password'])
-					except Exception as e2:
-						# in case of failure, e.g. user does not exist, we need revoke the password on the server
-						logger('Unable to rotate password for "'+str(item['username'])+'":', e2, '(trying to revoke)')
-						try:
-							jsonRequest('oco.agent.passwords', {
-								'passwords': [
-									{'username':item['username'], 'password':encrypt(item['password'], config['agent-key']), 'revoke':True}
-								]
-							})
-						except Exception as e3:
-							logger('Unable to revoke password for "'+str(item['username'])+'":', e3)
-			except Exception as e:
-				logger('Password rotation error:', e)
+					oldPassword = item['old_password'] if 'old_password' in item else ''
+
+					# change the password LOCALLY FIRST. Only once we know for sure it was
+					# really applied (updatePassword raises on any failure, including a
+					# failed post-change verification) do we tell the server about it -
+					# this way the server can never end up recording a password that
+					# isn't actually active on this machine.
+					pwr.updatePassword(username, newPassword, oldPassword)
+
+					# persist the new password locally until the server has confirmed
+					# receipt, so a crash right after a successful local change doesn't
+					# lose track of it (flushPendingPasswords() picks it up next run)
+					pending = readPendingPasswords()
+					pending.append({'username': username, 'password': newPassword})
+					writePendingPasswords(pending)
+
+					jsonRequest('oco.agent.passwords', {'passwords': [
+						{'username': username, 'password': encrypt(newPassword, config['agent-key'])}
+					]})
+
+					# reported successfully - drop it from the pending list
+					pending = [p for p in readPendingPasswords() if not (p.get('username') == username and p.get('password') == newPassword)]
+					if pending:
+						writePendingPasswords(pending)
+					else:
+						clearPendingPasswords()
+
+				except Exception as e:
+					# local change failed (or the server report failed and stays pending
+					# for the next retry): nothing to revoke, since nothing was ever
+					# recorded on the server before being confirmed locally. The rotation
+					# rule simply stays "due" and will be retried on the next hello cycle,
+					# with the same (still correct) old_password.
+					logger('Password rotation error for "'+str(username)+'":', e)
 
 
 def signal_handler(signum, frame):
